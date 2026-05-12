@@ -501,6 +501,154 @@ print("NormalObjects complaint graph compiled successfully.")
 print(f"Nodes : {list(workflow.nodes.keys())}")
 
 
+# ─── Step 5: Visualization ────────────────────────────────────────────────────
+
+# Node display order used when rendering the execution trace
+_NODE_ORDER = ["intake", "validate", "investigate", "resolve", "close"]
+
+_STEP_LABELS = {
+    "intake":      "INTAKE      — Parse & categorize",
+    "validate":    "VALIDATE    — Check against rules",
+    "investigate": "INVESTIGATE — Gather evidence",
+    "resolve":     "RESOLVE     — Apply fix",
+    "close":       "CLOSE       — Confirm & log",
+}
+
+_OUTCOME_LABELS = {
+    "close":               "CLOSED",
+    "escalated":           "ESCALATED — forwarded to specialist team",
+    "rejected":            "REJECTED  — insufficient detail",
+    "needs_clarification": "NEEDS CLARIFICATION — awaiting more info",
+}
+
+
+def print_graph_structure() -> None:
+    """
+    Print the static workflow graph in two formats:
+      1. LangGraph's built-in ASCII diagram (requires grandalf).
+      2. Mermaid source saved to workflow_graph.md for browser rendering.
+    """
+    print("\n" + "=" * 62)
+    print("  BLOYCE'S PROTOCOL — WORKFLOW GRAPH")
+    print("=" * 62)
+
+    # ── ASCII diagram ──────────────────────────────────────────────
+    try:
+        print(app.get_graph().draw_ascii())
+    except ImportError:
+        print("  (install grandalf for ASCII graph: pip install grandalf)")
+        print("""
+  [__start__]
+       |
+   [intake] ---------> END (needs_clarification)
+       |
+   [validate] -------> END (rejected / escalated)
+       |
+  [investigate] -----> END (rejected)
+       |
+   [resolve] --------> END (escalated)
+       |
+   [close]
+       |
+   [__end__]
+""")
+
+    # ── Mermaid diagram saved to file ─────────────────────────────
+    mermaid_src = app.get_graph().draw_mermaid()
+    mermaid_path = os.path.join(os.path.dirname(__file__), "workflow_graph.md")
+    with open(mermaid_path, "w") as f:
+        f.write("# NormalObjects — Bloyce's Protocol Workflow\n\n")
+        f.write("```mermaid\n")
+        f.write(mermaid_src)
+        f.write("\n```\n")
+    print(f"  Mermaid diagram saved → {mermaid_path}")
+    print("=" * 62)
+
+
+def visualize_execution(final: ComplaintState) -> None:
+    """
+    Print a step-by-step execution trace showing which nodes ran,
+    what each one decided, and the final outcome.
+    """
+    path: list[str] = final.get("workflow_path", [])
+    path_set = set(path)
+
+    # Build a quick lookup: step → the assistant message logged by that node
+    msg_by_step: dict[str, str] = {
+        m["step"]: m["content"]
+        for m in final.get("messages", [])
+        if "step" in m
+    }
+
+    print("\n" + "╔" + "═" * 60 + "╗")
+    print(f"║  EXECUTION TRACE  ·  {final['complaint_id']}  ·  {final['complainant_name']:<30}║")
+    print("╠" + "═" * 60 + "╣")
+    print(f"║  Category : {(final.get('category') or 'unknown'):<48}║")
+    print(f"║  Path     : {(' → '.join(path) or '(none)'):<48}║")
+    print("╚" + "═" * 60 + "╝")
+
+    for i, step in enumerate(_NODE_ORDER):
+        ran = step in path_set
+        marker = "►" if ran else "○"
+        label = _STEP_LABELS[step]
+
+        print(f"\n  {marker}  {label}")
+
+        if ran:
+            raw_msg = msg_by_step.get(step, "")
+            # Show a trimmed preview of what the node logged
+            preview = raw_msg.replace("\n", " ")
+            if len(preview) > 70:
+                preview = preview[:67] + "..."
+            if preview:
+                print(f"      └─ {preview}")
+
+            # Per-step detail callouts
+            if step == "intake":
+                missing = final.get("missing_fields") or []
+                print(f"      └─ missing fields : {missing or 'none'}")
+
+            elif step == "validate":
+                print(f"      └─ valid          : {final.get('is_valid')}")
+
+            elif step == "investigate":
+                complete = final.get("investigation_complete")
+                print(f"      └─ complete       : {complete}")
+
+            elif step == "resolve":
+                print(f"      └─ protocol       : {final.get('resolution_protocol', 'N/A')}")
+                print(f"      └─ rating         : {final.get('effectiveness_rating', 'N/A')}")
+                print(f"      └─ escalate       : {final.get('requires_escalation', False)}")
+
+            elif step == "close":
+                follow = final.get("follow_up_required", False)
+                print(f"      └─ follow-up      : {'YES — 30-day checkpoint required' if follow else 'no'}")
+                print(f"      └─ closed at      : {final.get('closed_at', 'N/A')}")
+        else:
+            print(f"      └─ (not reached)")
+
+        # Draw connector arrow if not the last node
+        if i < len(_NODE_ORDER) - 1:
+            print(f"           │")
+            print(f"           ▼")
+
+    # ── Final outcome banner ───────────────────────────────────────
+    outcome_key = final["current_step"]
+    outcome_label = _OUTCOME_LABELS.get(outcome_key, outcome_key.upper())
+    print("\n  " + "─" * 58)
+    print(f"  OUTCOME ▸  {outcome_label}")
+
+    if outcome_key in ("rejected", "escalated"):
+        reason = (final.get("error_message") or final.get("validation_notes") or "")
+        if reason:
+            print(f"  DETAIL  ▸  {reason[:70]}")
+
+    elif outcome_key == "needs_clarification":
+        print(f"  MISSING ▸  {final.get('missing_fields', [])}")
+
+    print("  " + "─" * 58 + "\n")
+
+
 # ─── Step 4: Test the Workflow ────────────────────────────────────────────────
 
 def run_complaint(complaint_id: str, complainant: str, complaint: str) -> ComplaintState:
@@ -568,6 +716,9 @@ def print_result(final: ComplaintState) -> None:
 
 
 if __name__ == "__main__":
+    # ── Show static graph structure first ─────────────────────────────────────
+    print_graph_structure()
+
     test_complaints = [
         # ── Happy-path complaints (full who/what/when/where) ──────────────────
         (
@@ -624,6 +775,7 @@ if __name__ == "__main__":
         print(f"{'━' * 60}")
         final = run_complaint(cid, name, text)
         print_result(final)
+        visualize_execution(final)
         results.append(final)
 
     # ── Summary table ──────────────────────────────────────────────────────────
