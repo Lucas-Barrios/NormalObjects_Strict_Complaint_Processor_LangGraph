@@ -6,13 +6,15 @@ Bloyce's Protocol — LangGraph Implementation
 import os
 import json
 import re
-from typing import TypedDict, Optional, Literal
+import operator
+from typing import TypedDict, Optional, Literal, Annotated
 from datetime import datetime
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, END
+from langgraph.types import Send
 
 load_dotenv()
 
@@ -60,7 +62,9 @@ class ComplaintState(TypedDict):
     validation_notes: Optional[str]          # reason for rejection or concerns
 
     # ── Investigation ──────────────────────────────────────────────────────────
-    investigation_findings: Optional[str]    # documented evidence
+    investigation_angle: Optional[str]                       # set per parallel sub-task
+    partial_findings: Annotated[list[str], operator.add]     # reducer merges parallel results
+    investigation_findings: Optional[str]                    # synthesized after merge
     investigation_complete: Optional[bool]
 
     # ── Resolution ─────────────────────────────────────────────────────────────
@@ -88,6 +92,16 @@ def _parse_json(text: str) -> dict:
     """Strip markdown fences and parse JSON from an LLM response."""
     text = re.sub(r"```(?:json)?\s*|\s*```", "", text).strip()
     return json.loads(text)
+
+
+# Fields managed by Annotated reducers — must NOT be re-emitted by regular
+# (non-parallel) nodes, otherwise the reducer doubles their value on each step.
+_REDUCER_FIELDS = frozenset({"partial_findings"})
+
+
+def _base(state: ComplaintState) -> dict:
+    """Return state dict without reducer-managed fields, safe to spread in returns."""
+    return {k: v for k, v in state.items() if k not in _REDUCER_FIELDS}
 
 
 # ─── Node 1: Intake ───────────────────────────────────────────────────────────
@@ -131,7 +145,7 @@ Respond ONLY with valid JSON."""
     next_step: WorkflowStatus = "needs_clarification" if missing_fields else "validate"
 
     return {
-        **state,
+        **_base(state),
         "category": category,
         "parsed_details": parsed_details,
         "missing_fields": missing_fields,
@@ -165,7 +179,7 @@ def validate_node(state: ComplaintState) -> ComplaintState:
     if category == "other":
         print("[VALIDATE] Category 'other' → auto-escalated for manual review.")
         return {
-            **state,
+            **_base(state),
             "is_valid": False,
             "validation_notes": "Category 'other' requires manual review per Bloyce's Protocol.",
             "requires_escalation": True,
@@ -204,7 +218,7 @@ Respond ONLY with a JSON object:
     next_step: WorkflowStatus = "investigate" if is_valid else "rejected"
 
     return {
-        **state,
+        **_base(state),
         "is_valid": is_valid,
         "validation_notes": reason,
         "error_message": None if is_valid else f"Rejected during validation: {reason}",
@@ -217,61 +231,82 @@ Respond ONLY with a JSON object:
     }
 
 
-# ─── Node 3: Investigation ────────────────────────────────────────────────────
+# ─── Node 3: Parallel Investigation ──────────────────────────────────────────
+#
+# Each category is investigated from multiple angles simultaneously via
+# LangGraph's Send API (fan-out). Results accumulate in partial_findings via
+# the Annotated reducer, then merge_findings_node synthesises them into a
+# single report before the workflow continues to resolution.
 
-_INVESTIGATION_FOCUS = {
-    "portal":        "Investigate temporal patterns, location consistency, and environmental factors.",
-    "monster":       "Gather behavioral data, interaction patterns, and environmental triggers.",
-    "psychic":       "Document ability specifications, tested limitations, and contextual factors.",
-    "environmental": "Analyze power line activity, atmospheric conditions, and anomaly correlation.",
+_INVESTIGATION_ANGLES: dict[str, list[str]] = {
+    "portal":        ["temporal_patterns", "location_consistency", "environmental_factors"],
+    "monster":       ["behavioral_data",   "interaction_patterns", "environmental_triggers"],
+    "psychic":       ["ability_specifications", "tested_limitations", "contextual_factors"],
+    "environmental": ["power_line_activity", "atmospheric_conditions", "anomaly_correlation"],
+    "other":         ["general_analysis"],
 }
 
-def investigate_node(state: ComplaintState) -> ComplaintState:
-    """Step 3: Investigation — Gather and document evidence per Bloyce's Protocol."""
-    print("\n[INVESTIGATE] Gathering evidence...")
 
-    category = state["category"]
-    complaint = state["raw_complaint"]
-    parsed = state.get("parsed_details", {})
-    focus = _INVESTIGATION_FOCUS.get(category, "Perform a general investigation.")
+def investigate_angle_node(state: ComplaintState) -> dict:
+    """
+    Single-angle sub-investigator — runs in parallel with sibling instances.
+    Returns ONLY the delta (partial_findings) so that the reducer can merge
+    results from all concurrent tasks without overwriting each other.
+    """
+    angle: str = state.get("investigation_angle") or "general_analysis"
+    category: str = state["category"]
+    complaint: str = state["raw_complaint"]
+    parsed: dict = state.get("parsed_details") or {}
 
-    prompt = f"""You are a NormalObjects field investigator applying Bloyce's Protocol.
+    prompt = f"""You are a NormalObjects field investigator (Bloyce's Protocol).
+You are examining ONE specific angle of a '{category}' complaint.
 
-Investigation focus for '{category}' complaints:
-{focus}
-
-Original complaint: {complaint}
+Angle: {angle.replace('_', ' ')}
+Complaint: {complaint}
 Parsed details: {json.dumps(parsed)}
 
-Produce a thorough investigation report. Respond ONLY with a JSON object:
-- "findings": documented evidence narrative (2–4 sentences)
-- "key_factors": list of 2–4 key factors identified
-- "investigation_complete": true, or false only if data is fundamentally insufficient"""
+Write 1–2 sentences of concrete, angle-specific findings. Plain text only."""
 
     response = llm.invoke([HumanMessage(content=prompt)])
-    result = _parse_json(response.content)
+    finding = f"[{angle}] {response.content.strip()}"
 
-    findings: str = result.get("findings", "Investigation inconclusive.")
-    complete: bool = bool(result.get("investigation_complete", True))
-    key_factors: list = result.get("key_factors", [])
+    print(f"[INVESTIGATE:{angle}] {finding[:72]}...")
+    return {"partial_findings": [finding]}   # reducer concatenates these
 
-    print(f"[INVESTIGATE] Complete    : {complete}")
-    print(f"[INVESTIGATE] Key factors : {key_factors}")
-    print(f"[INVESTIGATE] Findings    : {findings[:80]}...")
 
-    next_step: WorkflowStatus = "resolve" if complete else "rejected"
-    error = None if complete else "Investigation could not be completed: insufficient data."
+def merge_findings_node(state: ComplaintState) -> dict:
+    """
+    Fan-in node — synthesises all parallel partial_findings into one report,
+    then advances current_step so the router can proceed to resolve.
+    """
+    partial: list[str] = state.get("partial_findings") or []
+
+    print(f"\n[MERGE] Consolidating {len(partial)} parallel finding(s)...")
+    for p in partial:
+        print(f"  · {p[:78]}")
+
+    combined = "\n".join(partial)
+
+    prompt = f"""You are synthesising investigation results for a NormalObjects complaint.
+
+Findings from all angles:
+{combined}
+
+Write a single cohesive investigation report (3–4 sentences) integrating all findings."""
+
+    response = llm.invoke([HumanMessage(content=prompt)])
+    merged: str = response.content.strip()
+
+    print(f"[MERGE] Synthesis complete.")
 
     return {
-        **state,
-        "investigation_findings": findings,
-        "investigation_complete": complete,
-        "error_message": error,
-        "current_step": next_step,
+        "investigation_findings": merged,
+        "investigation_complete": True,
+        "current_step": "resolve",
         "workflow_path": state["workflow_path"] + ["investigate"],
         "messages": state["messages"] + [{
             "role": "assistant", "step": "investigate",
-            "content": findings,
+            "content": merged,
         }],
     }
 
@@ -323,7 +358,7 @@ Generate a resolution. Respond ONLY with a JSON object:
     next_step: WorkflowStatus = "escalated" if escalation else "close"
 
     return {
-        **state,
+        **_base(state),
         "resolution": resolution,
         "resolution_protocol": protocol,
         "effectiveness_rating": rating,
@@ -373,7 +408,7 @@ Generate a closure record. Respond ONLY with a JSON object:
     print(f"[CLOSE] Closed at     : {closed_at}")
 
     return {
-        **state,
+        **_base(state),
         "resolution_applied": True,
         "customer_satisfaction": satisfaction,
         "closed_at": closed_at,
@@ -403,16 +438,16 @@ def _route_after_intake(state: ComplaintState) -> str:
     return "validate"
 
 
-def _route_after_validate(state: ComplaintState) -> str:
+def _route_after_validate(state: ComplaintState):
     """
-    Validate → investigate (complaint passes rules)
-             → END         (rejected: insufficient detail)
-             → END         (escalated: category 'other')
+    Validate → fan-out to N parallel investigate_angle tasks via Send
+             → END (rejected or escalated)
     """
     step = state["current_step"]
     if step == "investigate":
-        print("[ROUTER] Validate → investigate")
-        return "investigate"
+        angles = _INVESTIGATION_ANGLES.get(state["category"], ["general_analysis"])
+        print(f"\n[DISPATCH] Launching {len(angles)} parallel sub-investigation(s): {angles}")
+        return [Send("investigate_angle", {**_base(state), "investigation_angle": a}) for a in angles]
     if step == "escalated":
         print("[ROUTER] Validate → escalated (END)")
         return END
@@ -420,15 +455,15 @@ def _route_after_validate(state: ComplaintState) -> str:
     return END
 
 
-def _route_after_investigate(state: ComplaintState) -> str:
+def _route_after_merge(state: ComplaintState) -> str:
     """
-    Investigate → resolve (evidence documented)
-                → END     (rejected: data insufficient)
+    merge_findings → resolve (synthesis complete)
+                  → END      (merge failed — data fundamentally insufficient)
     """
-    if state["current_step"] == "resolve":
-        print("[ROUTER] Investigate → resolve")
+    if state.get("investigation_complete"):
+        print("[ROUTER] Merge → resolve")
         return "resolve"
-    print("[ROUTER] Investigate → rejected (END)")
+    print("[ROUTER] Merge → rejected (END)")
     return END
 
 
@@ -449,23 +484,24 @@ def _route_after_resolve(state: ComplaintState) -> str:
 workflow = StateGraph(ComplaintState)
 
 # ── Add nodes ─────────────────────────────────────────────────────────────────
-workflow.add_node("intake",      intake_node)
-workflow.add_node("validate",    validate_node)
-workflow.add_node("investigate", investigate_node)
-workflow.add_node("resolve",     resolve_node)
-workflow.add_node("close",       close_node)
+workflow.add_node("intake",            intake_node)
+workflow.add_node("validate",          validate_node)
+workflow.add_node("investigate_angle", investigate_angle_node)   # parallel sub-task
+workflow.add_node("merge_findings",    merge_findings_node)      # fan-in
+workflow.add_node("resolve",           resolve_node)
+workflow.add_node("close",             close_node)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 workflow.set_entry_point("intake")
 
-# ── Conditional edges (Bloyce's Protocol routing) ─────────────────────────────
+# ── Edges ─────────────────────────────────────────────────────────────────────
 #
-#   intake ──► validate ──► investigate ──► resolve ──► close ──► END
-#       │           │              │             │
-#       ▼           ▼              ▼             ▼
-#      END         END            END           END
-#  (clarif.)   (rejected /    (rejected)    (escalated)
-#               escalated)
+#   intake ──► validate ──► Send(×N) ──► investigate_angle ──► merge_findings
+#       │           │                                                  │
+#       ▼           ▼                                             resolve ──► close ──► END
+#      END         END                                                │
+#  (clarif.)  (reject/esc.)                                          END
+#                                                                 (escalated)
 #
 workflow.add_conditional_edges(
     "intake",
@@ -473,15 +509,15 @@ workflow.add_conditional_edges(
     {"validate": "validate", END: END},
 )
 
-workflow.add_conditional_edges(
-    "validate",
-    _route_after_validate,
-    {"investigate": "investigate", END: END},
-)
+# Returns list[Send] for parallel dispatch — no path_map needed
+workflow.add_conditional_edges("validate", _route_after_validate)
+
+# All parallel sub-tasks funnel into the single merge node
+workflow.add_edge("investigate_angle", "merge_findings")
 
 workflow.add_conditional_edges(
-    "investigate",
-    _route_after_investigate,
+    "merge_findings",
+    _route_after_merge,
     {"resolve": "resolve", END: END},
 )
 
@@ -504,14 +540,15 @@ print(f"Nodes : {list(workflow.nodes.keys())}")
 # ─── Step 5: Visualization ────────────────────────────────────────────────────
 
 # Node display order used when rendering the execution trace
-_NODE_ORDER = ["intake", "validate", "investigate", "resolve", "close"]
+_NODE_ORDER = ["intake", "validate", "investigate", "merge_findings", "resolve", "close"]
 
 _STEP_LABELS = {
-    "intake":      "INTAKE      — Parse & categorize",
-    "validate":    "VALIDATE    — Check against rules",
-    "investigate": "INVESTIGATE — Gather evidence",
-    "resolve":     "RESOLVE     — Apply fix",
-    "close":       "CLOSE       — Confirm & log",
+    "intake":          "INTAKE          — Parse & categorize",
+    "validate":        "VALIDATE        — Check against rules",
+    "investigate":     "INVESTIGATE (×N)— Parallel sub-investigations",
+    "merge_findings":  "MERGE           — Synthesise findings",
+    "resolve":         "RESOLVE         — Apply fix",
+    "close":           "CLOSE           — Confirm & log",
 }
 
 _OUTCOME_LABELS = {
@@ -612,8 +649,10 @@ def visualize_execution(final: ComplaintState) -> None:
                 print(f"      └─ valid          : {final.get('is_valid')}")
 
             elif step == "investigate":
-                complete = final.get("investigation_complete")
-                print(f"      └─ complete       : {complete}")
+                angles = _INVESTIGATION_ANGLES.get(final.get("category") or "", [])
+                print(f"      └─ angles         : {angles}")
+                for pf in (final.get("partial_findings") or []):
+                    print(f"      └─ {pf[:72]}")
 
             elif step == "resolve":
                 print(f"      └─ protocol       : {final.get('resolution_protocol', 'N/A')}")
@@ -666,7 +705,9 @@ def run_complaint(complaint_id: str, complainant: str, complaint: str) -> Compla
         # validation fields
         "is_valid":              None,
         "validation_notes":      None,
-        # investigation fields
+        # investigation fields (parallel)
+        "investigation_angle":   None,
+        "partial_findings":      [],
         "investigation_findings": None,
         "investigation_complete": None,
         # resolution fields
