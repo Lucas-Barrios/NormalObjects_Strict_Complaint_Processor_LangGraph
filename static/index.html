@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NormalObjects — Complaint Processor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    * { font-family: 'JetBrains Mono', monospace; }
+
+    /* Slim custom scrollbar */
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+
+    /* Log terminal lines */
+    .log-line { font-size: 0.72rem; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+
+    /* Processing pulse dot */
+    @keyframes blink { 0%,100%{ opacity:1 } 50%{ opacity:.3 } }
+    .blink { animation: blink 1.4s ease-in-out infinite; }
+
+    /* Smooth panel transitions */
+    [x-cloak] { display: none !important; }
+  </style>
+</head>
+
+<body
+  class="bg-slate-950 text-slate-100 h-screen flex flex-col overflow-hidden"
+  x-data="app()"
+  x-init="init()"
+  x-cloak
+>
+
+<!-- ═══════════════════════════════════════════════════════════════ HEADER ══ -->
+<header class="flex items-center px-5 h-13 bg-slate-900 border-b border-slate-800 flex-shrink-0 gap-4" style="height:52px">
+  <!-- Logo -->
+  <div class="flex items-center gap-2.5">
+    <div class="w-7 h-7 rounded bg-indigo-600 flex items-center justify-center flex-shrink-0">
+      <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+          d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+      </svg>
+    </div>
+    <div class="leading-tight">
+      <div class="text-white text-sm font-semibold tracking-wide">NormalObjects</div>
+      <div class="text-slate-500 text-xs">Bloyce's Protocol</div>
+    </div>
+  </div>
+
+  <!-- Status pills -->
+  <div class="ml-auto flex items-center gap-3 text-xs text-slate-500">
+    <span x-text="`${complaints.length} complaint${complaints.length !== 1 ? 's' : ''}`"></span>
+    <span class="text-slate-700">·</span>
+    <div class="flex items-center gap-1.5">
+      <div class="w-1.5 h-1.5 rounded-full" :class="connected ? 'bg-emerald-400' : 'bg-red-500 blink'"></div>
+      <span x-text="connected ? 'connected' : 'offline'"></span>
+    </div>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════════════════════════════════ MAIN LAYOUT ══ -->
+<div class="flex flex-1 overflow-hidden">
+
+  <!-- ═══════════════════════════════════════════════════════════════ SIDEBAR ══ -->
+  <aside class="w-68 bg-slate-900 border-r border-slate-800 flex flex-col flex-shrink-0" style="width:272px">
+
+    <!-- New complaint button -->
+    <div class="p-3 border-b border-slate-800">
+      <button
+        @click="openForm()"
+        class="w-full flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded transition-colors">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+        </svg>
+        New Complaint
+      </button>
+    </div>
+
+    <!-- Complaint list -->
+    <div class="flex-1 overflow-y-auto">
+      <template x-if="complaints.length === 0">
+        <div class="p-6 text-center text-slate-600 text-xs leading-relaxed">
+          No complaints yet.<br/>Submit one to get started.
+        </div>
+      </template>
+
+      <template x-for="c in complaints" :key="c.complaint_id">
+        <button
+          @click="selectComplaint(c.complaint_id)"
+          :class="selected?.id === c.complaint_id
+            ? 'bg-slate-800/80 border-l-2 border-indigo-500'
+            : 'border-l-2 border-transparent hover:bg-slate-800/40'"
+          class="w-full text-left px-4 py-3 border-b border-slate-800/50 transition-colors">
+          <div class="flex items-center justify-between gap-2 mb-1">
+            <span class="text-xs font-bold text-slate-100 truncate" x-text="c.complaint_id"></span>
+            <span class="text-xs px-1.5 py-0.5 rounded border whitespace-nowrap flex-shrink-0"
+                  :class="badgeClass(c.final_step)"
+                  x-text="statusLabel(c.final_step)"></span>
+          </div>
+          <div class="text-xs text-slate-400 truncate" x-text="c.complainant_name || '—'"></div>
+          <div class="text-xs text-slate-600 mt-0.5 truncate" x-text="c.category || ''"></div>
+        </button>
+      </template>
+    </div>
+  </aside>
+
+  <!-- ═══════════════════════════════════════════════════════════ MAIN PANE ══ -->
+  <main class="flex-1 overflow-y-auto">
+
+    <!-- ──────────────────────────────────────────────── SUBMIT FORM ── -->
+    <div x-show="view === 'form'" x-transition.opacity class="max-w-xl mx-auto p-8">
+      <h2 class="text-lg font-semibold text-slate-100 mb-1">File a Complaint</h2>
+      <p class="text-xs text-slate-500 mb-7">Submit an incident report for processing under Bloyce's Protocol.</p>
+
+      <form @submit.prevent="submitComplaint()" class="space-y-5">
+
+        <!-- Complainant name -->
+        <div>
+          <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1.5">
+            Complainant Name
+          </label>
+          <input
+            x-model="form.complainant_name"
+            type="text" required
+            placeholder="e.g. Joyce Byers"
+            class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/50 transition-colors" />
+        </div>
+
+        <!-- Complaint text -->
+        <div>
+          <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1.5">
+            Complaint Description
+          </label>
+          <textarea
+            x-model="form.raw_complaint"
+            required rows="6"
+            placeholder="Describe the incident in detail — include who, what, when, and where for the fastest resolution..."
+            class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/50 transition-colors resize-none"></textarea>
+          <p class="mt-1 text-xs text-slate-600">Missing fields trigger a clarification step and delay resolution.</p>
+        </div>
+
+        <!-- Optional ID -->
+        <div>
+          <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1.5">
+            Complaint ID <span class="normal-case text-slate-600">(optional — auto-generated if blank)</span>
+          </label>
+          <input
+            x-model="form.complaint_id"
+            type="text"
+            placeholder="e.g. C-042"
+            class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/50 transition-colors" />
+        </div>
+
+        <!-- Error -->
+        <p x-show="formError" x-text="formError" class="text-red-400 text-xs bg-red-950/40 border border-red-900 rounded px-3 py-2"></p>
+
+        <!-- Submit button -->
+        <button
+          type="submit"
+          :disabled="submitting"
+          class="w-full flex items-center justify-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-semibold rounded transition-colors">
+          <template x-if="submitting">
+            <svg class="animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+            </svg>
+          </template>
+          <span x-text="submitting ? 'Submitting…' : 'Submit Complaint'"></span>
+        </button>
+      </form>
+    </div>
+
+    <!-- ──────────────────────────────────────────────── DETAIL VIEW ── -->
+    <div x-show="view === 'detail'" x-transition.opacity class="p-6">
+      <template x-if="selected">
+        <div class="max-w-3xl">
+
+          <!-- ── Header ─────────────────────────────────────────────── -->
+          <div class="flex items-start justify-between mb-5">
+            <div>
+              <div class="flex items-center gap-3 flex-wrap mb-1">
+                <h2 class="text-xl font-bold text-slate-100" x-text="selected.id"></h2>
+                <span class="text-xs px-2 py-0.5 rounded border"
+                      :class="badgeClass(selected.status)"
+                      x-text="statusLabel(selected.status)"></span>
+                <template x-if="selected.memoryStatus === 'processing'">
+                  <div class="flex items-center gap-1.5 text-blue-400 text-xs">
+                    <div class="w-1.5 h-1.5 rounded-full bg-blue-400 blink"></div>
+                    processing
+                  </div>
+                </template>
+              </div>
+              <p class="text-xs text-slate-500">
+                <span x-text="selected.state?.complainant_name || '—'"></span>
+                <span class="mx-1.5 text-slate-700">·</span>
+                <span x-text="selected.state?.submitted_at
+                  ? new Date(selected.state.submitted_at).toLocaleString()
+                  : '—'"></span>
+              </p>
+            </div>
+            <button
+              @click="openForm()"
+              class="flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-500 hover:text-slate-200 border border-slate-800 hover:border-slate-600 rounded transition-colors flex-shrink-0">
+              <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+              </svg>
+              New
+            </button>
+          </div>
+
+          <!-- ── Workflow path breadcrumb ────────────────────────────── -->
+          <div x-show="selected.state?.workflow_path?.length" class="flex items-center flex-wrap gap-1 mb-5">
+            <template x-for="(step, i) in (selected.state?.workflow_path || [])" :key="i">
+              <div class="flex items-center gap-1">
+                <span class="text-xs px-2 py-0.5 bg-slate-800/80 text-slate-400 rounded border border-slate-700/60"
+                      x-text="step"></span>
+                <svg x-show="i < (selected.state?.workflow_path?.length || 0) - 1"
+                     class="w-3 h-3 text-slate-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                </svg>
+              </div>
+            </template>
+          </div>
+
+          <!-- ── Detail cards ────────────────────────────────────────── -->
+          <div class="grid grid-cols-2 gap-3 mb-5">
+            <div class="bg-slate-900 border border-slate-800 rounded-lg p-3.5">
+              <div class="text-xs text-slate-600 uppercase tracking-wider mb-1">Category</div>
+              <div class="text-sm text-slate-200 capitalize" x-text="selected.state?.category || '—'"></div>
+            </div>
+            <div class="bg-slate-900 border border-slate-800 rounded-lg p-3.5">
+              <div class="text-xs text-slate-600 uppercase tracking-wider mb-1">Protocol</div>
+              <div class="text-sm text-slate-200" x-text="selected.state?.resolution_protocol || '—'"></div>
+            </div>
+            <div class="bg-slate-900 border border-slate-800 rounded-lg p-3.5">
+              <div class="text-xs text-slate-600 uppercase tracking-wider mb-1">Effectiveness</div>
+              <div class="text-sm font-semibold"
+                   :class="ratingClass(selected.state?.effectiveness_rating)"
+                   x-text="(selected.state?.effectiveness_rating || '—').toUpperCase()"></div>
+            </div>
+            <div class="bg-slate-900 border border-slate-800 rounded-lg p-3.5">
+              <div class="text-xs text-slate-600 uppercase tracking-wider mb-1">Follow-up</div>
+              <div class="text-sm"
+                   :class="selected.state?.follow_up_required ? 'text-yellow-400' : 'text-slate-400'"
+                   x-text="selected.state?.follow_up_required === true
+                     ? 'YES — 30-day checkpoint'
+                     : (selected.state?.follow_up_required === false ? 'No' : '—')"></div>
+            </div>
+          </div>
+
+          <!-- ── Resolution ──────────────────────────────────────────── -->
+          <template x-if="selected.state?.resolution">
+            <div class="bg-slate-900 border border-slate-800 rounded-lg p-4 mb-5">
+              <div class="text-xs text-slate-600 uppercase tracking-wider mb-2">Resolution</div>
+              <p class="text-sm text-slate-300 leading-relaxed" x-text="selected.state.resolution"></p>
+            </div>
+          </template>
+
+          <!-- ── Validation / error note ─────────────────────────────── -->
+          <template x-if="selected.state?.error_message || selected.state?.validation_notes">
+            <div class="bg-red-950/30 border border-red-900/60 rounded-lg p-4 mb-5">
+              <div class="text-xs text-red-500 uppercase tracking-wider mb-1">
+                <span x-text="selected.state?.error_message ? 'Rejection Reason' : 'Validation Notes'"></span>
+              </div>
+              <p class="text-sm text-red-300"
+                 x-text="selected.state?.error_message || selected.state?.validation_notes"></p>
+            </div>
+          </template>
+
+          <!-- ── Missing fields note ─────────────────────────────────── -->
+          <template x-if="selected.state?.missing_fields?.length">
+            <div class="bg-yellow-950/30 border border-yellow-900/60 rounded-lg p-4 mb-5">
+              <div class="text-xs text-yellow-500 uppercase tracking-wider mb-1">Missing Information</div>
+              <p class="text-sm text-yellow-300"
+                 x-text="'The following fields were absent: ' + selected.state.missing_fields.join(', ')"></p>
+              <p class="text-xs text-yellow-700 mt-1">Please resubmit with the missing details.</p>
+            </div>
+          </template>
+
+          <!-- ═══════════════════════════ HITL APPROVAL PANEL ══════ -->
+          <template x-if="selected.memoryStatus === 'awaiting_approval' && selected.hitlData">
+            <div class="bg-purple-950/30 border border-purple-700/60 rounded-lg p-5 mb-5">
+              <div class="flex items-center gap-2 mb-4">
+                <svg class="w-4 h-4 text-purple-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+                </svg>
+                <h3 class="text-purple-300 font-semibold text-sm">Human Approval Required</h3>
+                <span class="ml-auto text-xs px-2 py-0.5 bg-purple-900/60 text-purple-300 border border-purple-700 rounded"
+                      x-text="(selected.hitlData.rating || '').toUpperCase() + ' effectiveness'"></span>
+              </div>
+
+              <div class="mb-4">
+                <div class="text-xs text-purple-500 uppercase tracking-wider mb-1.5">Proposed Resolution</div>
+                <p class="text-sm text-purple-200 leading-relaxed" x-text="selected.hitlData.resolution"></p>
+                <p class="text-xs text-purple-600 mt-1" x-text="'Protocol: ' + (selected.hitlData.protocol || '—')"></p>
+              </div>
+
+              <!-- Buttons -->
+              <div class="flex gap-2 mb-3">
+                <button
+                  @click="decide('approve')"
+                  :disabled="deciding"
+                  class="flex-1 py-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white text-xs font-semibold rounded transition-colors">
+                  ✓ Approve
+                </button>
+                <button
+                  @click="decide('reject')"
+                  :disabled="deciding"
+                  class="flex-1 py-2 bg-red-700 hover:bg-red-600 disabled:opacity-50 text-white text-xs font-semibold rounded transition-colors">
+                  ✗ Reject
+                </button>
+              </div>
+
+              <!-- Override input -->
+              <div class="flex gap-2">
+                <input
+                  x-model="overrideText"
+                  type="text"
+                  placeholder="Or type an override resolution and submit…"
+                  class="flex-1 bg-purple-900/20 border border-purple-800 rounded px-3 py-2 text-sm text-purple-100 placeholder-purple-800 focus:outline-none focus:border-purple-500 transition-colors" />
+                <button
+                  @click="decide(overrideText)"
+                  :disabled="deciding || !overrideText.trim()"
+                  class="px-3 py-2 bg-purple-700 hover:bg-purple-600 disabled:opacity-40 text-white text-xs font-semibold rounded transition-colors whitespace-nowrap">
+                  Override
+                </button>
+              </div>
+            </div>
+          </template>
+
+          <!-- ═════════════════════════════ LOG TERMINAL ═══════════════ -->
+          <template x-if="logs.length > 0">
+            <div class="border border-slate-800 rounded-lg overflow-hidden mb-5">
+              <div class="flex items-center justify-between px-4 py-2 bg-slate-900/80 border-b border-slate-800">
+                <span class="text-xs text-slate-500 font-medium tracking-wide">PROCESSING LOG</span>
+                <template x-if="selected.memoryStatus === 'processing'">
+                  <div class="flex items-center gap-1.5 text-blue-400 text-xs">
+                    <div class="w-1.5 h-1.5 rounded-full bg-blue-400 blink"></div>
+                    live
+                  </div>
+                </template>
+                <template x-if="selected.memoryStatus !== 'processing'">
+                  <span class="text-xs text-slate-700">archived</span>
+                </template>
+              </div>
+              <div
+                class="bg-black p-4 h-60 overflow-y-auto"
+                x-ref="logContainer">
+                <template x-for="(line, i) in logs" :key="i">
+                  <div class="log-line" :class="logLineClass(line)" x-text="line"></div>
+                </template>
+              </div>
+            </div>
+          </template>
+
+          <!-- ── Customer satisfaction ───────────────────────────────── -->
+          <template x-if="selected.state?.customer_satisfaction">
+            <div class="bg-emerald-950/20 border border-emerald-900/50 rounded-lg p-4 mb-5">
+              <div class="text-xs text-emerald-600 uppercase tracking-wider mb-1.5">Customer Response</div>
+              <p class="text-sm text-emerald-300" x-text="selected.state.customer_satisfaction"></p>
+              <p class="text-xs text-slate-600 mt-1.5"
+                 x-text="'Closed: ' + (selected.state.closed_at
+                   ? new Date(selected.state.closed_at).toLocaleString()
+                   : '—')"></p>
+            </div>
+          </template>
+
+        </div>
+      </template>
+
+      <!-- Empty / no-selection state -->
+      <template x-if="!selected">
+        <div class="flex flex-col items-center justify-center h-64 text-slate-700">
+          <svg class="w-10 h-10 mb-3 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+              d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+          </svg>
+          <p class="text-sm">Select a complaint from the sidebar</p>
+        </div>
+      </template>
+    </div>
+
+  </main>
+</div><!-- end flex layout -->
+
+<!-- ═══════════════════════════════════════════════════════════ ALPINE.JS ══ -->
+<script>
+function app() {
+  return {
+    // ── State ─────────────────────────────────────────────────────────────
+    complaints:   [],
+    selected:     null,   // { id, status, state, memoryStatus, hitlData }
+    view:         'form', // 'form' | 'detail'
+    logs:         [],
+    eventSource:  null,
+    connected:    true,
+
+    // ── Form ──────────────────────────────────────────────────────────────
+    form:         { complainant_name: '', raw_complaint: '', complaint_id: '' },
+    submitting:   false,
+    formError:    null,
+    deciding:     false,
+    overrideText: '',
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────
+    async init() {
+      await this.loadComplaints();
+      setInterval(() => this.loadComplaints(), 3000);
+    },
+
+    async loadComplaints() {
+      try {
+        const res = await fetch('/api/complaints');
+        this.complaints = await res.json();
+        this.connected = true;
+        // Sync selected card's status pill
+        if (this.selected) {
+          const fresh = this.complaints.find(c => c.complaint_id === this.selected.id);
+          if (fresh) this.selected.status = fresh.final_step;
+        }
+      } catch { this.connected = false; }
+    },
+
+    // ── Navigation ────────────────────────────────────────────────────────
+    openForm() {
+      this.view = 'form';
+      this.selected = null;
+      this.logs = [];
+      this.formError = null;
+      this.closeSSE();
+    },
+
+    async selectComplaint(id) {
+      this.closeSSE();
+      this.logs = [];
+      this.view = 'detail';
+
+      try {
+        const res  = await fetch(`/api/complaints/${id}`);
+        const data = await res.json();
+        this.selected = {
+          id,
+          status:       data.state?.current_step || data.memory_status || 'unknown',
+          state:        data.state,
+          memoryStatus: data.memory_status,
+          hitlData:     data.hitl_data,
+        };
+      } catch {
+        this.selected = { id, status: 'unknown', state: null, memoryStatus: null, hitlData: null };
+      }
+
+      if (this.selected.memoryStatus) this.connectSSE(id);
+    },
+
+    // ── SSE ───────────────────────────────────────────────────────────────
+    connectSSE(id) {
+      this.eventSource = new EventSource(`/api/complaints/${id}/logs`);
+
+      this.eventSource.onmessage = async (e) => {
+        const msg = JSON.parse(e.data);
+
+        if (msg.type === 'log') {
+          this.logs.push(msg.text);
+          this.$nextTick(() => this.scrollLogs());
+
+        } else if (msg.type === 'step') {
+          this.logs.push(`  ▸ completed: ${msg.step}`);
+          this.$nextTick(() => this.scrollLogs());
+
+        } else if (msg.type === 'status') {
+          if (this.selected) {
+            this.selected.status       = msg.status;
+            this.selected.memoryStatus = msg.status;
+          }
+          await this.loadComplaints();
+
+        } else if (msg.type === 'hitl') {
+          if (this.selected) {
+            this.selected.hitlData     = msg.data;
+            this.selected.memoryStatus = 'awaiting_approval';
+            this.selected.status       = 'awaiting_approval';
+          }
+
+        } else if (msg.type === 'error') {
+          this.logs.push(`✗ ERROR: ${msg.text}`);
+          this.$nextTick(() => this.scrollLogs());
+
+        } else if (msg.type === 'done') {
+          this.closeSSE();
+          // Reload full state from checkpoint
+          const res  = await fetch(`/api/complaints/${id}`);
+          const data = await res.json();
+          if (this.selected?.id === id) {
+            this.selected.state        = data.state;
+            this.selected.status       = data.state?.current_step || this.selected.status;
+            this.selected.memoryStatus = data.memory_status;
+          }
+          await this.loadComplaints();
+        }
+      };
+
+      this.eventSource.onerror = () => this.closeSSE();
+    },
+
+    closeSSE() {
+      if (this.eventSource) { this.eventSource.close(); this.eventSource = null; }
+    },
+
+    scrollLogs() {
+      const el = this.$refs.logContainer;
+      if (el) el.scrollTop = el.scrollHeight;
+    },
+
+    // ── Actions ───────────────────────────────────────────────────────────
+    async submitComplaint() {
+      this.submitting = true;
+      this.formError  = null;
+      try {
+        const res = await fetch('/api/complaints', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify(this.form),
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          this.formError = err.detail || 'Submission failed.';
+          return;
+        }
+        const data = await res.json();
+        this.form  = { complainant_name: '', raw_complaint: '', complaint_id: '' };
+        await this.loadComplaints();
+        await this.selectComplaint(data.complaint_id);
+      } catch (err) {
+        this.formError = err.message;
+      } finally {
+        this.submitting = false;
+      }
+    },
+
+    async decide(decision) {
+      if (!decision?.trim() || !this.selected) return;
+      this.deciding = true;
+      try {
+        await fetch(`/api/complaints/${this.selected.id}/decide`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ decision }),
+        });
+        this.selected.memoryStatus = 'processing';
+        this.selected.status       = 'processing';
+        this.overrideText          = '';
+        this.selected.hitlData     = null;
+        this.connectSSE(this.selected.id);
+      } finally {
+        this.deciding = false;
+      }
+    },
+
+    // ── Display helpers ───────────────────────────────────────────────────
+    statusLabel(step) {
+      return {
+        close:               'Closed',
+        processing:          'Processing',
+        awaiting_approval:   'Needs Approval',
+        rejected:            'Rejected',
+        escalated:           'Escalated',
+        needs_clarification: 'Needs Info',
+        failed:              'Failed',
+        error:               'Error',
+      }[step] || (step || 'Unknown');
+    },
+
+    badgeClass(step) {
+      return ({
+        close:               'text-emerald-400 bg-emerald-950/60 border-emerald-800',
+        processing:          'text-blue-400   bg-blue-950/60   border-blue-800',
+        awaiting_approval:   'text-purple-400 bg-purple-950/60 border-purple-700',
+        rejected:            'text-red-400    bg-red-950/60    border-red-800',
+        escalated:           'text-orange-400 bg-orange-950/60 border-orange-800',
+        needs_clarification: 'text-yellow-400 bg-yellow-950/60 border-yellow-800',
+        failed:              'text-red-500    bg-red-950/60    border-red-900',
+        error:               'text-red-500    bg-red-950/60    border-red-900',
+      })[step] || 'text-slate-400 bg-slate-800/60 border-slate-700';
+    },
+
+    ratingClass(r) {
+      return r === 'high'   ? 'text-emerald-400' :
+             r === 'medium' ? 'text-yellow-400'  :
+             r === 'low'    ? 'text-red-400'      : 'text-slate-500';
+    },
+
+    logLineClass(line) {
+      if (!line) return 'text-slate-700';
+      if (line.includes('[INTAKE]'))       return 'text-cyan-400';
+      if (line.includes('[VALIDATE]'))     return 'text-blue-400';
+      if (line.includes('[INVESTIGATE'))   return 'text-yellow-400';
+      if (line.includes('[MERGE]'))        return 'text-orange-400';
+      if (line.includes('[RESOLVE]'))      return 'text-violet-400';
+      if (line.includes('[APPROVAL]'))     return 'text-purple-300';
+      if (line.includes('[CLOSE]'))        return 'text-emerald-400';
+      if (line.includes('[DB]'))           return 'text-slate-600';
+      if (line.includes('[RETRY]'))        return 'text-red-400';
+      if (line.includes('[ROUTER]') || line.includes('[DISPATCH]')) return 'text-slate-600';
+      if (line.includes('ERROR') || line.startsWith('✗')) return 'text-red-400';
+      if (line.startsWith('  ▸'))          return 'text-slate-600 italic';
+      return 'text-slate-400';
+    },
+  };
+}
+</script>
+</body>
+</html>
