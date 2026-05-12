@@ -6,15 +6,18 @@ Bloyce's Protocol — LangGraph Implementation
 import os
 import json
 import re
+import time
+import sqlite3
 import operator
 from typing import TypedDict, Optional, Literal, Annotated
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, END
-from langgraph.types import Send
+from langgraph.types import Send, interrupt, Command
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 load_dotenv()
 
@@ -39,6 +42,8 @@ WorkflowStatus = Literal[
     "rejected",
     "needs_clarification",
     "escalated",
+    "failed",            # LLM retries exhausted
+    "awaiting_approval", # paused at HITL checkpoint
 ]
 
 
@@ -73,6 +78,10 @@ class ComplaintState(TypedDict):
     effectiveness_rating: Optional[EffectivenessRating]
     requires_escalation: Optional[bool]
 
+    # ── Human-in-the-loop ──────────────────────────────────────────────────────
+    human_approval_required: Optional[bool]  # True when rating is not "high"
+    human_decision: Optional[str]            # "approve", "reject", or override text
+
     # ── Closure ────────────────────────────────────────────────────────────────
     resolution_applied: Optional[bool]
     customer_satisfaction: Optional[str]    # verified response from complainant
@@ -83,6 +92,7 @@ class ComplaintState(TypedDict):
     current_step: WorkflowStatus
     workflow_path: list[str]               # ordered list of completed steps
     error_message: Optional[str]           # populated on rejection or error
+    retry_counts: Optional[dict]           # maps step name → retries used (0 = first-attempt success)
     messages: list[dict]                   # full LLM message history
 
 
@@ -102,6 +112,75 @@ _REDUCER_FIELDS = frozenset({"partial_findings"})
 def _base(state: ComplaintState) -> dict:
     """Return state dict without reducer-managed fields, safe to spread in returns."""
     return {k: v for k, v in state.items() if k not in _REDUCER_FIELDS}
+
+
+# ─── Retry Helpers ────────────────────────────────────────────────────────────
+
+MAX_RETRIES = 3      # maximum LLM call attempts per step
+RETRY_DELAY = 1.0    # base back-off in seconds (doubles each retry)
+
+
+def _invoke_json(messages: list, step: str, max_retries: int = MAX_RETRIES) -> tuple[dict, int]:
+    """
+    Call the LLM and parse the JSON response with exponential back-off.
+    Returns (parsed_dict, retries_used).  Raises RuntimeError after max_retries.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = llm.invoke(messages)
+            return _parse_json(response.content), attempt - 1
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+            print(f"[RETRY:{step}] Attempt {attempt}/{max_retries} — JSON parse error: {exc}")
+        except Exception as exc:
+            last_error = exc
+            print(f"[RETRY:{step}] Attempt {attempt}/{max_retries} — LLM error: {exc}")
+        if attempt < max_retries:
+            delay = RETRY_DELAY * (2 ** (attempt - 1))
+            print(f"[RETRY:{step}] Waiting {delay:.1f}s before retry {attempt + 1}...")
+            time.sleep(delay)
+    raise RuntimeError(
+        f"Step '{step}' failed after {max_retries} attempt(s): {last_error}"
+    ) from last_error
+
+
+def _invoke_text(messages: list, step: str, max_retries: int = MAX_RETRIES) -> tuple[str, int]:
+    """
+    Call the LLM and return plain text with exponential back-off.
+    Returns (text, retries_used).  Raises RuntimeError after max_retries.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = llm.invoke(messages)
+            return response.content.strip(), attempt - 1
+        except Exception as exc:
+            last_error = exc
+            print(f"[RETRY:{step}] Attempt {attempt}/{max_retries} — LLM error: {exc}")
+        if attempt < max_retries:
+            delay = RETRY_DELAY * (2 ** (attempt - 1))
+            print(f"[RETRY:{step}] Waiting {delay:.1f}s before retry {attempt + 1}...")
+            time.sleep(delay)
+    raise RuntimeError(
+        f"Step '{step}' failed after {max_retries} attempt(s): {last_error}"
+    ) from last_error
+
+
+def _failed_state(state: ComplaintState, step: str, error: Exception) -> dict:
+    """Build a terminal 'failed' state dict when a node exhausts all its retries."""
+    msg = str(error)
+    print(f"[{step.upper()}] Exhausted retries — marking complaint as failed.")
+    return {
+        **_base(state),
+        "current_step": "failed",
+        "error_message": f"[{step}] {msg}",
+        "workflow_path": state.get("workflow_path", []) + [step],
+        "messages": state.get("messages", []) + [{
+            "role": "system", "step": step,
+            "content": f"FAILED after retries: {msg}",
+        }],
+    }
 
 
 # ─── Node 1: Intake ───────────────────────────────────────────────────────────
@@ -132,8 +211,10 @@ Complaint: {complaint}
 
 Respond ONLY with valid JSON."""
 
-    response = llm.invoke([HumanMessage(content=prompt)])
-    result = _parse_json(response.content)
+    try:
+        result, retries = _invoke_json([HumanMessage(content=prompt)], "intake")
+    except RuntimeError as exc:
+        return _failed_state(state, "intake", exc)
 
     category = result.get("category", "other")
     parsed_details = result.get("parsed_details", {})
@@ -151,6 +232,7 @@ Respond ONLY with valid JSON."""
         "missing_fields": missing_fields,
         "current_step": next_step,
         "workflow_path": state.get("workflow_path", []) + ["intake"],
+        "retry_counts": {**(state.get("retry_counts") or {}), "intake": retries},
         "messages": state["messages"] + [{
             "role": "assistant", "step": "intake",
             "content": f"Categorized as '{category}'. Missing fields: {missing_fields}",
@@ -206,8 +288,10 @@ Respond ONLY with a JSON object:
 - "is_valid": true or false
 - "reason": one-sentence explanation"""
 
-    response = llm.invoke([HumanMessage(content=prompt)])
-    result = _parse_json(response.content)
+    try:
+        result, retries = _invoke_json([HumanMessage(content=prompt)], "validate")
+    except RuntimeError as exc:
+        return _failed_state(state, "validate", exc)
 
     is_valid: bool = bool(result.get("is_valid", False))
     reason: str = result.get("reason", "No reason provided.")
@@ -224,6 +308,7 @@ Respond ONLY with a JSON object:
         "error_message": None if is_valid else f"Rejected during validation: {reason}",
         "current_step": next_step,
         "workflow_path": state["workflow_path"] + ["validate"],
+        "retry_counts": {**(state.get("retry_counts") or {}), "validate": retries},
         "messages": state["messages"] + [{
             "role": "assistant", "step": "validate",
             "content": f"Valid: {is_valid}. {reason}",
@@ -267,9 +352,15 @@ Parsed details: {json.dumps(parsed)}
 
 Write 1–2 sentences of concrete, angle-specific findings. Plain text only."""
 
-    response = llm.invoke([HumanMessage(content=prompt)])
-    finding = f"[{angle}] {response.content.strip()}"
+    try:
+        text, retries = _invoke_text([HumanMessage(content=prompt)], f"investigate:{angle}")
+        if retries:
+            print(f"[INVESTIGATE:{angle}] Succeeded after {retries} retry/retries.")
+    except RuntimeError as exc:
+        text = f"ERROR — retries exhausted: {exc}"
+        print(f"[INVESTIGATE:{angle}] Retries exhausted — recording error as finding.")
 
+    finding = f"[{angle}] {text}"
     print(f"[INVESTIGATE:{angle}] {finding[:72]}...")
     return {"partial_findings": [finding]}   # reducer concatenates these
 
@@ -294,8 +385,10 @@ Findings from all angles:
 
 Write a single cohesive investigation report (3–4 sentences) integrating all findings."""
 
-    response = llm.invoke([HumanMessage(content=prompt)])
-    merged: str = response.content.strip()
+    try:
+        merged, retries = _invoke_text([HumanMessage(content=prompt)], "merge")
+    except RuntimeError as exc:
+        return _failed_state(state, "merge_findings", exc)
 
     print(f"[MERGE] Synthesis complete.")
 
@@ -304,6 +397,7 @@ Write a single cohesive investigation report (3–4 sentences) integrating all f
         "investigation_complete": True,
         "current_step": "resolve",
         "workflow_path": state["workflow_path"] + ["investigate"],
+        "retry_counts": {**(state.get("retry_counts") or {}), "merge": retries},
         "messages": state["messages"] + [{
             "role": "assistant", "step": "investigate",
             "content": merged,
@@ -319,6 +413,9 @@ _RESOLUTION_PROTOCOLS = {
     "psychic":       "Downside Up Psychic Ability Restoration Protocol (DPA-5): document baselines and execute recovery steps.",
     "environmental": "Downside Up Environmental Anomaly Protocol (DEA-2): coordinate with Power Grid and Atmospheric teams.",
 }
+
+# Ratings below "high" require a human officer to sign off before closure.
+_APPROVAL_REQUIRED_RATINGS: frozenset[str] = frozenset({"low", "medium"})
 
 def resolve_node(state: ComplaintState) -> ComplaintState:
     """Step 4: Resolution — Apply a specific, protocol-backed fix with effectiveness rating."""
@@ -343,8 +440,10 @@ Generate a resolution. Respond ONLY with a JSON object:
 - "effectiveness_rating": "high", "medium", or "low"
 - "requires_escalation": true only if the situation is severe and needs a specialized team"""
 
-    response = llm.invoke([HumanMessage(content=prompt)])
-    result = _parse_json(response.content)
+    try:
+        result, retries = _invoke_json([HumanMessage(content=prompt)], "resolve")
+    except RuntimeError as exc:
+        return _failed_state(state, "resolve", exc)
 
     resolution: str = result.get("resolution", "No resolution generated.")
     protocol: str = result.get("resolution_protocol", "GIP-1")
@@ -355,7 +454,17 @@ Generate a resolution. Respond ONLY with a JSON object:
     print(f"[RESOLVE] Rating    : {rating}")
     print(f"[RESOLVE] Escalate  : {escalation}")
 
-    next_step: WorkflowStatus = "escalated" if escalation else "close"
+    needs_approval = (rating in _APPROVAL_REQUIRED_RATINGS) and not escalation
+    next_step: WorkflowStatus = (
+        "escalated"          if escalation else
+        "awaiting_approval"  if needs_approval else
+        "close"
+    )
+
+    if needs_approval:
+        print(f"[RESOLVE] Approval  : required (rating is '{rating}', not 'high')")
+    else:
+        print(f"[RESOLVE] Approval  : not required")
 
     return {
         **_base(state),
@@ -363,8 +472,10 @@ Generate a resolution. Respond ONLY with a JSON object:
         "resolution_protocol": protocol,
         "effectiveness_rating": rating,
         "requires_escalation": escalation,
+        "human_approval_required": needs_approval,
         "current_step": next_step,
         "workflow_path": state["workflow_path"] + ["resolve"],
+        "retry_counts": {**(state.get("retry_counts") or {}), "resolve": retries},
         "messages": state["messages"] + [{
             "role": "assistant", "step": "resolve",
             "content": f"Protocol: {protocol}. Rating: {rating}. {resolution}",
@@ -395,8 +506,10 @@ Generate a closure record. Respond ONLY with a JSON object:
 - "customer_satisfaction": one-sentence simulated satisfaction note from the complainant
 - "outcome_summary": one-sentence outcome suitable for the complaint log"""
 
-    response = llm.invoke([HumanMessage(content=prompt)])
-    result = _parse_json(response.content)
+    try:
+        result, retries = _invoke_json([HumanMessage(content=prompt)], "close")
+    except RuntimeError as exc:
+        return _failed_state(state, "close", exc)
 
     satisfaction: str = result.get("customer_satisfaction", "Satisfaction not recorded.")
     outcome: str = result.get("outcome_summary", "Complaint closed.")
@@ -415,9 +528,79 @@ Generate a closure record. Respond ONLY with a JSON object:
         "follow_up_required": follow_up,
         "current_step": "close",
         "workflow_path": state["workflow_path"] + ["close"],
+        "retry_counts": {**(state.get("retry_counts") or {}), "close": retries},
         "messages": state["messages"] + [{
             "role": "assistant", "step": "close",
             "content": outcome,
+        }],
+    }
+
+
+# ─── Node 6: Human Approval ──────────────────────────────────────────────────
+#
+# Triggered when resolve_node sets effectiveness_rating to "medium" or "low".
+# Uses LangGraph's interrupt() to pause the graph, checkpoint state, and wait
+# for the caller to provide a Command(resume=decision).
+#
+# decision values:
+#   "approve"  → accept the LLM resolution and proceed to close
+#   "reject"   → stop here; complaint is rejected by the reviewer
+#   <any text> → override: replace the resolution with the reviewer's text,
+#                then proceed to close
+
+def human_approval_node(state: ComplaintState) -> dict:
+    """Step 6: Human Approval — pause and wait for a senior officer to review."""
+    complaint_id = state["complaint_id"]
+    rating       = state.get("effectiveness_rating", "medium")
+    resolution   = state.get("resolution", "")
+    protocol     = state.get("resolution_protocol", "")
+
+    print("\n" + "─" * 60)
+    print(f"[APPROVAL] Human sign-off required for [{complaint_id}]")
+    print(f"[APPROVAL] Rating    : {rating.upper()}  (below auto-approval threshold)")
+    print(f"[APPROVAL] Protocol  : {protocol}")
+    print(f"[APPROVAL] Resolution: {resolution[:120]}")
+    print("─" * 60)
+    print("[APPROVAL] Respond: 'approve' | 'reject' | override text")
+
+    # ── Pause graph here; resume value becomes decision ────────────────────────
+    decision: str = interrupt({
+        "complaint_id": complaint_id,
+        "prompt":       "Approve, reject, or provide an override resolution.",
+        "resolution":   resolution,
+        "protocol":     protocol,
+        "rating":       rating,
+    })
+
+    decision_str = str(decision).strip()
+    approved  = decision_str.lower() == "approve"
+    rejected  = decision_str.lower() in ("reject", "no")
+    overridden = not approved and not rejected
+
+    if approved:
+        print(f"[APPROVAL] APPROVED — proceeding to closure.")
+        next_step: WorkflowStatus = "close"
+        final_resolution = resolution
+    elif rejected:
+        print(f"[APPROVAL] REJECTED — complaint closed without resolution.")
+        next_step = "rejected"
+        final_resolution = resolution
+    else:
+        print(f"[APPROVAL] OVERRIDE — reviewer substituted a new resolution.")
+        next_step = "close"
+        final_resolution = decision_str
+
+    return {
+        **_base(state),
+        "human_decision":  decision_str,
+        "resolution":      final_resolution,
+        "error_message":   "Rejected by human reviewer." if rejected else None,
+        "current_step":    next_step,
+        "workflow_path":   state["workflow_path"] + ["human_approval"],
+        "messages":        state["messages"] + [{
+            "role": "human", "step": "human_approval",
+            "content": f"Decision: {decision_str}"
+                       + (" (override)" if overridden else ""),
         }],
     }
 
@@ -428,10 +611,15 @@ Generate a closure record. Respond ONLY with a JSON object:
 
 def _route_after_intake(state: ComplaintState) -> str:
     """
-    Intake → validate (happy path)
-           → END      (missing fields flagged for clarification)
+    Intake → validate            (happy path)
+           → END (clarification) (missing fields flagged)
+           → END (failed)        (retries exhausted)
     """
-    if state["current_step"] == "needs_clarification":
+    step = state["current_step"]
+    if step == "failed":
+        print("[ROUTER] Intake → failed (END)")
+        return END
+    if step == "needs_clarification":
         print("[ROUTER] Intake → needs clarification (END)")
         return END
     print("[ROUTER] Intake → validate")
@@ -441,9 +629,12 @@ def _route_after_intake(state: ComplaintState) -> str:
 def _route_after_validate(state: ComplaintState):
     """
     Validate → fan-out to N parallel investigate_angle tasks via Send
-             → END (rejected or escalated)
+             → END (rejected, escalated, or failed)
     """
     step = state["current_step"]
+    if step == "failed":
+        print("[ROUTER] Validate → failed (END)")
+        return END
     if step == "investigate":
         angles = _INVESTIGATION_ANGLES.get(state["category"], ["general_analysis"])
         print(f"\n[DISPATCH] Launching {len(angles)} parallel sub-investigation(s): {angles}")
@@ -458,8 +649,11 @@ def _route_after_validate(state: ComplaintState):
 def _route_after_merge(state: ComplaintState) -> str:
     """
     merge_findings → resolve (synthesis complete)
-                  → END      (merge failed — data fundamentally insufficient)
+                  → END      (failed or data fundamentally insufficient)
     """
+    if state["current_step"] == "failed":
+        print("[ROUTER] Merge → failed (END)")
+        return END
     if state.get("investigation_complete"):
         print("[ROUTER] Merge → resolve")
         return "resolve"
@@ -469,13 +663,34 @@ def _route_after_merge(state: ComplaintState) -> str:
 
 def _route_after_resolve(state: ComplaintState) -> str:
     """
-    Resolve → close    (standard path)
-            → END      (escalated to specialized team)
+    Resolve → human_approval (medium/low rating — needs sign-off)
+            → close          (high rating — auto-approved)
+            → END            (escalated or failed)
     """
-    if state["current_step"] == "close":
-        print("[ROUTER] Resolve → close")
+    step = state["current_step"]
+    if step == "failed":
+        print("[ROUTER] Resolve → failed (END)")
+        return END
+    if step == "awaiting_approval":
+        print("[ROUTER] Resolve → human_approval (sign-off required)")
+        return "human_approval"
+    if step == "close":
+        print("[ROUTER] Resolve → close (high effectiveness — auto-approved)")
         return "close"
     print("[ROUTER] Resolve → escalated (END)")
+    return END
+
+
+def _route_after_approval(state: ComplaintState) -> str:
+    """
+    human_approval → close  (approved or overridden by reviewer)
+                  → END     (rejected by reviewer)
+    """
+    step = state["current_step"]
+    if step == "close":
+        print("[ROUTER] Approval → close")
+        return "close"
+    print("[ROUTER] Approval → rejected by human (END)")
     return END
 
 
@@ -489,6 +704,7 @@ workflow.add_node("validate",          validate_node)
 workflow.add_node("investigate_angle", investigate_angle_node)   # parallel sub-task
 workflow.add_node("merge_findings",    merge_findings_node)      # fan-in
 workflow.add_node("resolve",           resolve_node)
+workflow.add_node("human_approval",    human_approval_node)      # HITL checkpoint
 workflow.add_node("close",             close_node)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -498,10 +714,10 @@ workflow.set_entry_point("intake")
 #
 #   intake ──► validate ──► Send(×N) ──► investigate_angle ──► merge_findings
 #       │           │                                                  │
-#       ▼           ▼                                             resolve ──► close ──► END
-#      END         END                                                │
-#  (clarif.)  (reject/esc.)                                          END
-#                                                                 (escalated)
+#       ▼           ▼                                             resolve ──► human_approval ──► close ──► END
+#      END         END                                                │               │
+#  (clarif.)  (reject/esc.)                                     (esc/fail)    (reject → END)
+#                                          (high rating skips human_approval ──────────────►)
 #
 workflow.add_conditional_edges(
     "intake",
@@ -524,14 +740,45 @@ workflow.add_conditional_edges(
 workflow.add_conditional_edges(
     "resolve",
     _route_after_resolve,
+    {"close": "close", "human_approval": "human_approval", END: END},
+)
+
+workflow.add_conditional_edges(
+    "human_approval",
+    _route_after_approval,
     {"close": "close", END: END},
 )
 
 # close is always terminal
 workflow.add_edge("close", END)
 
+# ── Step 9: SQLite Persistence ────────────────────────────────────────────────
+DB_PATH = os.path.join(os.path.dirname(__file__), "complaints.db")
+
+_db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+
+# Human-readable audit table — separate from LangGraph's checkpoint tables
+_db_conn.execute("""
+    CREATE TABLE IF NOT EXISTS complaint_summaries (
+        complaint_id      TEXT PRIMARY KEY,
+        complainant_name  TEXT,
+        submitted_at      TEXT,
+        category          TEXT,
+        final_step        TEXT,
+        effectiveness     TEXT,
+        protocol          TEXT,
+        human_decision    TEXT,
+        closed_at         TEXT,
+        follow_up         INTEGER,
+        error_message     TEXT,
+        saved_at          TEXT
+    )""")
+_db_conn.commit()
+
+_checkpointer = SqliteSaver(_db_conn)
+
 # ── Compile ───────────────────────────────────────────────────────────────────
-app = workflow.compile()
+app = workflow.compile(checkpointer=_checkpointer)
 
 print("NormalObjects complaint graph compiled successfully.")
 print(f"Nodes : {list(workflow.nodes.keys())}")
@@ -540,7 +787,10 @@ print(f"Nodes : {list(workflow.nodes.keys())}")
 # ─── Step 5: Visualization ────────────────────────────────────────────────────
 
 # Node display order used when rendering the execution trace
-_NODE_ORDER = ["intake", "validate", "investigate", "merge_findings", "resolve", "close"]
+_NODE_ORDER = [
+    "intake", "validate", "investigate", "merge_findings",
+    "resolve", "human_approval", "close",
+]
 
 _STEP_LABELS = {
     "intake":          "INTAKE          — Parse & categorize",
@@ -548,14 +798,17 @@ _STEP_LABELS = {
     "investigate":     "INVESTIGATE (×N)— Parallel sub-investigations",
     "merge_findings":  "MERGE           — Synthesise findings",
     "resolve":         "RESOLVE         — Apply fix",
+    "human_approval":  "HUMAN APPROVAL  — Senior officer sign-off",
     "close":           "CLOSE           — Confirm & log",
 }
 
 _OUTCOME_LABELS = {
     "close":               "CLOSED",
-    "escalated":           "ESCALATED — forwarded to specialist team",
-    "rejected":            "REJECTED  — insufficient detail",
+    "escalated":           "ESCALATED        — forwarded to specialist team",
+    "rejected":            "REJECTED         — insufficient detail or human veto",
     "needs_clarification": "NEEDS CLARIFICATION — awaiting more info",
+    "failed":              "FAILED           — LLM retries exhausted",
+    "awaiting_approval":   "AWAITING APPROVAL — paused for human sign-off",
 }
 
 
@@ -658,6 +911,15 @@ def visualize_execution(final: ComplaintState) -> None:
                 print(f"      └─ protocol       : {final.get('resolution_protocol', 'N/A')}")
                 print(f"      └─ rating         : {final.get('effectiveness_rating', 'N/A')}")
                 print(f"      └─ escalate       : {final.get('requires_escalation', False)}")
+                print(f"      └─ HITL required  : {final.get('human_approval_required', False)}")
+
+            elif step == "human_approval":
+                decision = final.get("human_decision") or "(pending)"
+                approved  = decision.lower() == "approve"
+                rejected  = decision.lower() in ("reject", "no")
+                tag = "APPROVED" if approved else ("REJECTED" if rejected else "OVERRIDE")
+                print(f"      └─ decision       : {decision[:60]}")
+                print(f"      └─ outcome        : {tag}")
 
             elif step == "close":
                 follow = final.get("follow_up_required", False)
@@ -685,48 +947,165 @@ def visualize_execution(final: ComplaintState) -> None:
     elif outcome_key == "needs_clarification":
         print(f"  MISSING ▸  {final.get('missing_fields', [])}")
 
+    if final.get("human_decision"):
+        print(f"  HUMAN   ▸  decision = {final['human_decision'][:60]}")
+
     print("  " + "─" * 58 + "\n")
+
+
+# ─── Step 9: Persistence Functions ───────────────────────────────────────────
+
+def save_complaint_summary(final: ComplaintState) -> None:
+    """Upsert a one-row human-readable summary into complaint_summaries."""
+    _db_conn.execute("""
+        INSERT OR REPLACE INTO complaint_summaries
+          (complaint_id, complainant_name, submitted_at, category,
+           final_step, effectiveness, protocol, human_decision,
+           closed_at, follow_up, error_message, saved_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        final["complaint_id"],
+        final["complainant_name"],
+        final.get("submitted_at"),
+        final.get("category"),
+        final["current_step"],
+        final.get("effectiveness_rating"),
+        final.get("resolution_protocol"),
+        final.get("human_decision"),
+        final.get("closed_at"),
+        int(bool(final.get("follow_up_required"))),
+        final.get("error_message"),
+        datetime.now(timezone.utc).isoformat(),
+    ))
+    _db_conn.commit()
+    print(f"[DB] Saved summary for {final['complaint_id']} → {os.path.basename(DB_PATH)}")
+
+
+def list_saved_complaints() -> list[dict]:
+    """Return all rows from complaint_summaries, newest first."""
+    cur = _db_conn.execute("""
+        SELECT complaint_id, complainant_name, category,
+               final_step, effectiveness, protocol, closed_at, saved_at
+        FROM   complaint_summaries
+        ORDER  BY saved_at DESC
+    """)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def print_saved_complaints() -> None:
+    """Print a table of all persisted complaints from the database."""
+    rows = list_saved_complaints()
+    print("\n" + "=" * 72)
+    print(f"  PERSISTED COMPLAINTS  ·  {os.path.basename(DB_PATH)}")
+    print("=" * 72)
+    if not rows:
+        print("  (no records saved yet)")
+    else:
+        print(f"  {'ID':<10} {'Name':<18} {'Category':<14} {'Step':<22} {'Rating'}")
+        print(f"  {'─'*9} {'─'*17} {'─'*13} {'─'*21} {'─'*8}")
+        for r in rows:
+            print(
+                f"  {r['complaint_id']:<10}"
+                f" {(r['complainant_name'] or ''):<18}"
+                f" {(r['category'] or 'N/A'):<14}"
+                f" {r['final_step']:<22}"
+                f" {r['effectiveness'] or '—'}"
+            )
+    print("=" * 72)
+
+
+def load_complaint_state(complaint_id: str) -> ComplaintState | None:
+    """
+    Retrieve the latest checkpointed state for a complaint from SQLite.
+    Returns None if no checkpoint exists for that thread_id.
+    """
+    config = {"configurable": {"thread_id": complaint_id}}
+    snapshot = app.get_state(config)
+    if snapshot and snapshot.values:
+        return snapshot.values  # type: ignore[return-value]
+    return None
 
 
 # ─── Step 4: Test the Workflow ────────────────────────────────────────────────
 
-def run_complaint(complaint_id: str, complainant: str, complaint: str) -> ComplaintState:
-    """Run a single complaint through the full graph and return the final state."""
+def run_complaint(
+    complaint_id: str,
+    complainant: str,
+    complaint: str,
+    *,
+    auto_approve: bool = False,
+) -> ComplaintState:
+    """
+    Run a single complaint through the full graph and return the final state.
+
+    When a resolution requires human sign-off:
+    - auto_approve=False (default): blocks and reads a decision from stdin.
+    - auto_approve=True           : silently approves (for batch / non-interactive use).
+    """
     initial_state: ComplaintState = {
-        "complaint_id":          complaint_id,
-        "raw_complaint":         complaint,
-        "complainant_name":      complainant,
-        "submitted_at":          datetime.utcnow().isoformat() + "Z",
+        "complaint_id":           complaint_id,
+        "raw_complaint":          complaint,
+        "complainant_name":       complainant,
+        "submitted_at":           datetime.utcnow().isoformat() + "Z",
         # intake fields
-        "category":              None,
-        "parsed_details":        None,
-        "missing_fields":        None,
-        "duplicate_of":          None,
+        "category":               None,
+        "parsed_details":         None,
+        "missing_fields":         None,
+        "duplicate_of":           None,
         # validation fields
-        "is_valid":              None,
-        "validation_notes":      None,
+        "is_valid":               None,
+        "validation_notes":       None,
         # investigation fields (parallel)
-        "investigation_angle":   None,
-        "partial_findings":      [],
+        "investigation_angle":    None,
+        "partial_findings":       [],
         "investigation_findings": None,
         "investigation_complete": None,
         # resolution fields
-        "resolution":            None,
-        "resolution_protocol":   None,
-        "effectiveness_rating":  None,
-        "requires_escalation":   None,
+        "resolution":             None,
+        "resolution_protocol":    None,
+        "effectiveness_rating":   None,
+        "requires_escalation":    None,
+        # HITL fields
+        "human_approval_required": None,
+        "human_decision":          None,
         # closure fields
-        "resolution_applied":    None,
-        "customer_satisfaction": None,
-        "closed_at":             None,
-        "follow_up_required":    None,
+        "resolution_applied":     None,
+        "customer_satisfaction":  None,
+        "closed_at":              None,
+        "follow_up_required":     None,
         # workflow control
-        "current_step":          "intake",
-        "workflow_path":         [],
-        "error_message":         None,
-        "messages":              [],
+        "current_step":           "intake",
+        "workflow_path":          [],
+        "error_message":          None,
+        "retry_counts":           {},
+        "messages":               [],
     }
-    return app.invoke(initial_state)
+    config = {"configurable": {"thread_id": complaint_id}}
+
+    # ── First pass: run until completion or human-approval interrupt ───────────
+    final: ComplaintState | None = None
+    for chunk in app.stream(initial_state, config, stream_mode="values"):
+        final = chunk
+
+    # ── Check for a pending human-approval interrupt ───────────────────────────
+    snapshot = app.get_state(config)
+    if snapshot.next:
+        if auto_approve:
+            decision = "approve"
+            print("[APPROVAL] Auto-approved (batch mode).")
+        else:
+            decision = (
+                input("\n  Decision (approve / reject / override text) → ").strip()
+                or "approve"
+            )
+
+        # ── Resume graph with the human decision ───────────────────────────────
+        for chunk in app.stream(Command(resume=decision), config, stream_mode="values"):
+            final = chunk
+
+    save_complaint_summary(final)  # type: ignore[arg-type]
+    return final  # type: ignore[return-value]
 
 
 def print_result(final: ComplaintState) -> None:
@@ -743,6 +1122,11 @@ def print_result(final: ComplaintState) -> None:
     if final["current_step"] == "close":
         print(f"  Protocol    : {final.get('resolution_protocol', 'N/A')}")
         print(f"  Effectiveness: {final.get('effectiveness_rating', 'N/A')}")
+        if final.get("human_decision"):
+            tag = {"approve": "APPROVED", "reject": "REJECTED"}.get(
+                final["human_decision"].lower(), "OVERRIDE"
+            )
+            print(f"  Human review: {tag} — '{final['human_decision'][:50]}'")
         print(f"  Follow-up   : {final.get('follow_up_required', False)}")
         print(f"  Closed at   : {final.get('closed_at', 'N/A')}")
         print(f"  Satisfaction: {final.get('customer_satisfaction', 'N/A')}")
@@ -753,7 +1137,48 @@ def print_result(final: ComplaintState) -> None:
         print(f"  Reason      : {final.get('error_message', 'N/A')}")
     elif final["current_step"] == "escalated":
         print(f"  Note        : {final.get('validation_notes') or final.get('error_message', 'N/A')}")
+    elif final["current_step"] == "failed":
+        print(f"  Error       : {final.get('error_message', 'N/A')}")
+    retry_counts = final.get("retry_counts") or {}
+    if retry_counts:
+        retried = {k: v for k, v in retry_counts.items() if v}
+        if retried:
+            print(f"  Retries     : {retried}")
     print(sep)
+
+
+# ─── Step 8: Human-in-the-Loop Demo ──────────────────────────────────────────
+
+def run_hitl_demo() -> None:
+    """
+    Interactive demonstration of the HITL checkpoint.
+    Runs Chief Hopper's monster complaint and pauses at the approval node so
+    the user can type a decision in the terminal.
+
+    Try each option to see different outcomes:
+      • approve             → complaint closes with the LLM's resolution
+      • reject              → complaint is rejected by the reviewer
+      • <custom text>       → your text replaces the LLM resolution, then closes
+    """
+    print("\n" + "=" * 62)
+    print("  STEP 8 — HUMAN-IN-THE-LOOP DEMO")
+    print("=" * 62)
+    print("  Complaint : C-002-hitl  (Chief Hopper / monster)")
+    print("  The graph will pause at 'human_approval' and wait for your input.")
+    print("  Options   : 'approve' | 'reject' | type an override resolution")
+    print("=" * 62)
+
+    complaint = (
+        "On October 31st in the Hawkins National Laboratory tunnel network "
+        "I observed two demogorgons that alternated between coordinated "
+        "pack-hunting behaviour and violent in-fighting within the same hour. "
+        "One creature pinned a lab technician while the other patrolled the "
+        "perimeter, which suggests a hierarchy I have not seen documented before."
+    )
+    # auto_approve=False → will block at the interrupt and read from stdin
+    final = run_complaint("C-002-hitl", "Chief Hopper", complaint, auto_approve=False)
+    print_result(final)
+    visualize_execution(final)
 
 
 if __name__ == "__main__":
@@ -814,7 +1239,9 @@ if __name__ == "__main__":
         print(f"  [{cid}] {name}")
         print(f"  \"{text[:65]}...\"")
         print(f"{'━' * 60}")
-        final = run_complaint(cid, name, text)
+        # auto_approve=True keeps the batch non-interactive;
+        # any HITL checkpoint is silently approved.
+        final = run_complaint(cid, name, text, auto_approve=True)
         print_result(final)
         visualize_execution(final)
         results.append(final)
@@ -826,10 +1253,40 @@ if __name__ == "__main__":
     print(f"  {'ID':<8} {'Category':<15} {'Final Step':<22} {'Rating'}")
     print(f"  {'─'*7} {'─'*14} {'─'*21} {'─'*8}")
     for r in results:
+        hitl = "✓" if r.get("human_decision") else " "
         print(
             f"  {r['complaint_id']:<8}"
             f" {(r.get('category') or 'N/A'):<15}"
             f" {r['current_step']:<22}"
-            f" {r.get('effectiveness_rating') or '—'}"
+            f" {r.get('effectiveness_rating') or '—':<8}"
+            f" HITL:{hitl}"
         )
     print("=" * 60)
+
+    # ── Interactive HITL demo ──────────────────────────────────────────────────
+    run_hitl_demo()
+
+    # ── Step 9: Persistence demo ───────────────────────────────────────────────
+    print("\n" + "=" * 62)
+    print("  STEP 9 — PERSISTENCE DEMO")
+    print("=" * 62)
+    print(f"  All complaints persisted to: {DB_PATH}")
+
+    # Show every record saved to the summaries table
+    print_saved_complaints()
+
+    # Reload one complaint directly from the SQLite checkpoint store
+    sample_id = "C-001"
+    print(f"\n  Reloading state for [{sample_id}] from SQLite checkpoint...")
+    reloaded = load_complaint_state(sample_id)
+    if reloaded:
+        print(f"  complaint_id    : {reloaded['complaint_id']}")
+        print(f"  complainant     : {reloaded['complainant_name']}")
+        print(f"  category        : {reloaded.get('category')}")
+        print(f"  final_step      : {reloaded['current_step']}")
+        print(f"  workflow_path   : {' → '.join(reloaded.get('workflow_path', []))}")
+        print(f"  effectiveness   : {reloaded.get('effectiveness_rating', 'N/A')}")
+        print(f"  closed_at       : {reloaded.get('closed_at', 'N/A')}")
+    else:
+        print(f"  No checkpoint found for [{sample_id}].")
+    print("=" * 62)
