@@ -12,6 +12,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage
+from langgraph.graph import StateGraph, END
 
 load_dotenv()
 
@@ -384,3 +385,117 @@ Generate a closure record. Respond ONLY with a JSON object:
             "content": outcome,
         }],
     }
+
+
+# ─── Conditional Routers ──────────────────────────────────────────────────────
+# Each router reads current_step (set by the node that just ran) and returns
+# the name of the next node — or END for terminal states.
+
+def _route_after_intake(state: ComplaintState) -> str:
+    """
+    Intake → validate (happy path)
+           → END      (missing fields flagged for clarification)
+    """
+    if state["current_step"] == "needs_clarification":
+        print("[ROUTER] Intake → needs clarification (END)")
+        return END
+    print("[ROUTER] Intake → validate")
+    return "validate"
+
+
+def _route_after_validate(state: ComplaintState) -> str:
+    """
+    Validate → investigate (complaint passes rules)
+             → END         (rejected: insufficient detail)
+             → END         (escalated: category 'other')
+    """
+    step = state["current_step"]
+    if step == "investigate":
+        print("[ROUTER] Validate → investigate")
+        return "investigate"
+    if step == "escalated":
+        print("[ROUTER] Validate → escalated (END)")
+        return END
+    print("[ROUTER] Validate → rejected (END)")
+    return END
+
+
+def _route_after_investigate(state: ComplaintState) -> str:
+    """
+    Investigate → resolve (evidence documented)
+                → END     (rejected: data insufficient)
+    """
+    if state["current_step"] == "resolve":
+        print("[ROUTER] Investigate → resolve")
+        return "resolve"
+    print("[ROUTER] Investigate → rejected (END)")
+    return END
+
+
+def _route_after_resolve(state: ComplaintState) -> str:
+    """
+    Resolve → close    (standard path)
+            → END      (escalated to specialized team)
+    """
+    if state["current_step"] == "close":
+        print("[ROUTER] Resolve → close")
+        return "close"
+    print("[ROUTER] Resolve → escalated (END)")
+    return END
+
+
+# ─── Graph Construction ───────────────────────────────────────────────────────
+
+workflow = StateGraph(ComplaintState)
+
+# ── Add nodes ─────────────────────────────────────────────────────────────────
+workflow.add_node("intake",      intake_node)
+workflow.add_node("validate",    validate_node)
+workflow.add_node("investigate", investigate_node)
+workflow.add_node("resolve",     resolve_node)
+workflow.add_node("close",       close_node)
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+workflow.set_entry_point("intake")
+
+# ── Conditional edges (Bloyce's Protocol routing) ─────────────────────────────
+#
+#   intake ──► validate ──► investigate ──► resolve ──► close ──► END
+#       │           │              │             │
+#       ▼           ▼              ▼             ▼
+#      END         END            END           END
+#  (clarif.)   (rejected /    (rejected)    (escalated)
+#               escalated)
+#
+workflow.add_conditional_edges(
+    "intake",
+    _route_after_intake,
+    {"validate": "validate", END: END},
+)
+
+workflow.add_conditional_edges(
+    "validate",
+    _route_after_validate,
+    {"investigate": "investigate", END: END},
+)
+
+workflow.add_conditional_edges(
+    "investigate",
+    _route_after_investigate,
+    {"resolve": "resolve", END: END},
+)
+
+workflow.add_conditional_edges(
+    "resolve",
+    _route_after_resolve,
+    {"close": "close", END: END},
+)
+
+# close is always terminal
+workflow.add_edge("close", END)
+
+# ── Compile ───────────────────────────────────────────────────────────────────
+app = workflow.compile()
+
+print("NormalObjects complaint graph compiled successfully.")
+print(f"Nodes : {list(workflow.nodes.keys())}")
