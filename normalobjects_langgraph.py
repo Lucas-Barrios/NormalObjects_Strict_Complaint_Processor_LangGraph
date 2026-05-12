@@ -10,7 +10,7 @@ from typing import TypedDict, Optional, Literal
 from datetime import datetime
 
 from dotenv import load_dotenv
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, END
 
@@ -19,7 +19,7 @@ load_dotenv()
 
 # ─── LLM Setup ────────────────────────────────────────────────────────────────
 
-llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 
 # ─── Category Types ───────────────────────────────────────────────────────────
@@ -499,3 +499,144 @@ app = workflow.compile()
 
 print("NormalObjects complaint graph compiled successfully.")
 print(f"Nodes : {list(workflow.nodes.keys())}")
+
+
+# ─── Step 4: Test the Workflow ────────────────────────────────────────────────
+
+def run_complaint(complaint_id: str, complainant: str, complaint: str) -> ComplaintState:
+    """Run a single complaint through the full graph and return the final state."""
+    initial_state: ComplaintState = {
+        "complaint_id":          complaint_id,
+        "raw_complaint":         complaint,
+        "complainant_name":      complainant,
+        "submitted_at":          datetime.utcnow().isoformat() + "Z",
+        # intake fields
+        "category":              None,
+        "parsed_details":        None,
+        "missing_fields":        None,
+        "duplicate_of":          None,
+        # validation fields
+        "is_valid":              None,
+        "validation_notes":      None,
+        # investigation fields
+        "investigation_findings": None,
+        "investigation_complete": None,
+        # resolution fields
+        "resolution":            None,
+        "resolution_protocol":   None,
+        "effectiveness_rating":  None,
+        "requires_escalation":   None,
+        # closure fields
+        "resolution_applied":    None,
+        "customer_satisfaction": None,
+        "closed_at":             None,
+        "follow_up_required":    None,
+        # workflow control
+        "current_step":          "intake",
+        "workflow_path":         [],
+        "error_message":         None,
+        "messages":              [],
+    }
+    return app.invoke(initial_state)
+
+
+def print_result(final: ComplaintState) -> None:
+    """Print a concise summary of the final complaint state."""
+    sep = "─" * 60
+    print(f"\n{sep}")
+    print(f"  ID          : {final['complaint_id']}")
+    print(f"  Complainant : {final['complainant_name']}")
+    print(f"  Complaint   : {final['raw_complaint'][:70]}...")
+    print(f"  Category    : {final.get('category', 'N/A')}")
+    print(f"  Path taken  : {' → '.join(final.get('workflow_path', []))}")
+    print(f"  Final step  : {final['current_step']}")
+
+    if final["current_step"] == "close":
+        print(f"  Protocol    : {final.get('resolution_protocol', 'N/A')}")
+        print(f"  Effectiveness: {final.get('effectiveness_rating', 'N/A')}")
+        print(f"  Follow-up   : {final.get('follow_up_required', False)}")
+        print(f"  Closed at   : {final.get('closed_at', 'N/A')}")
+        print(f"  Satisfaction: {final.get('customer_satisfaction', 'N/A')}")
+    elif final["current_step"] == "needs_clarification":
+        print(f"  Missing     : {final.get('missing_fields', [])}")
+        print(f"  Action      : Complainant must supply missing details before proceeding.")
+    elif final["current_step"] == "rejected":
+        print(f"  Reason      : {final.get('error_message', 'N/A')}")
+    elif final["current_step"] == "escalated":
+        print(f"  Note        : {final.get('validation_notes') or final.get('error_message', 'N/A')}")
+    print(sep)
+
+
+if __name__ == "__main__":
+    test_complaints = [
+        # ── Happy-path complaints (full who/what/when/where) ──────────────────
+        (
+            "C-001", "Joyce Byers",
+            "On the night of November 6th at our home on Maple Street, Hawkins, "
+            "the portal to the Downside Up opened three times at completely "
+            "unpredictable intervals — 9 PM, 2 AM, and 5 AM. Each opening lasted "
+            "roughly 4 minutes and left scorch marks on the living-room wall. "
+            "I need to know how to predict when it will open next so I can keep "
+            "my family safe.",
+        ),
+        (
+            "C-002", "Chief Hopper",
+            "On October 31st in the Hawkins National Laboratory tunnel network "
+            "I observed two demogorgons that alternated between coordinated "
+            "pack-hunting behaviour and violent in-fighting within the same hour. "
+            "One creature pinned a lab technician while the other patrolled the "
+            "perimeter, which suggests a hierarchy I have not seen documented before.",
+        ),
+        (
+            "C-003", "Mike Wheeler",
+            "Yesterday afternoon at Hawkins Middle School gymnasium, Eleven "
+            "attempted to remotely view a target in Russia using her psychic "
+            "abilities. She could establish contact for roughly 10 seconds before "
+            "experiencing severe nosebleeds and complete ability shutdown. She "
+            "has never hit this range limitation before and cannot lift objects "
+            "heavier than approximately 50 lbs since the incident.",
+        ),
+        (
+            "C-004", "Bob Newby",
+            "This past Monday evening at the Hawkins Power Station on Route 6, "
+            "every transformer on the north grid tripped simultaneously the moment "
+            "a pack of demodogs passed beneath the high-voltage lines. The outage "
+            "lasted 22 minutes, and a 10-metre dead zone of vegetation appeared "
+            "around each pylon. This has happened twice in the last two weeks.",
+        ),
+        # ── Deliberately vague — should trigger needs_clarification ───────────
+        (
+            "C-005", "Billy Hargrove",
+            "Something weird happened and I want someone to fix it.",
+        ),
+    ]
+
+    print("\n" + "=" * 60)
+    print("  NormalObjects — Bloyce's Protocol Workflow Test")
+    print("=" * 60)
+    print(f"\nRunning {len(test_complaints)} test complaints...\n")
+
+    results = []
+    for cid, name, text in test_complaints:
+        print(f"\n{'━' * 60}")
+        print(f"  [{cid}] {name}")
+        print(f"  \"{text[:65]}...\"")
+        print(f"{'━' * 60}")
+        final = run_complaint(cid, name, text)
+        print_result(final)
+        results.append(final)
+
+    # ── Summary table ──────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  SUMMARY")
+    print("=" * 60)
+    print(f"  {'ID':<8} {'Category':<15} {'Final Step':<22} {'Rating'}")
+    print(f"  {'─'*7} {'─'*14} {'─'*21} {'─'*8}")
+    for r in results:
+        print(
+            f"  {r['complaint_id']:<8}"
+            f" {(r.get('category') or 'N/A'):<15}"
+            f" {r['current_step']:<22}"
+            f" {r.get('effectiveness_rating') or '—'}"
+        )
+    print("=" * 60)
